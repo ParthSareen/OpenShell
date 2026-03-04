@@ -9,7 +9,7 @@ mod docker;
 mod kubeconfig;
 mod metadata;
 mod mtls;
-mod paths;
+pub mod paths;
 mod pki;
 pub(crate) mod push;
 mod runtime;

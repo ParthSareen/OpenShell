@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "navigator-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MicroVM runtime using libkrun for hardware-isolated execution"
+
+[lib]
+name = "navigator_vm"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+miette = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

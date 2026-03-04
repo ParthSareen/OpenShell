@@ -2717,6 +2717,7 @@ dependencies = [
  "navigator-policy",
  "navigator-providers",
  "navigator-tui",
+ "navigator-vm",
  "owo-colors",
  "prost-types",
  "rcgen",
@@ -2896,6 +2897,15 @@ dependencies = [
  "tonic",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "navigator-vm"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "miette",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

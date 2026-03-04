@@ -35,6 +35,26 @@ pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
     Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
 }
 
+pub fn xdg_data_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .into_diagnostic()
+        .wrap_err("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local").join("share"))
+}
+
+/// Default rootfs directory for gateway microVMs.
+///
+/// Location: `$XDG_DATA_HOME/nemoclaw/gateway/rootfs`
+pub fn default_rootfs_dir() -> Result<PathBuf> {
+    Ok(xdg_data_dir()?
+        .join("nemoclaw")
+        .join("gateway")
+        .join("rootfs"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
