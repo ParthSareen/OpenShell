@@ -52,3 +52,9 @@ description = "Run sandbox file sync e2e test"
 depends = ["cluster"]
 run = "bash e2e/bash/test_sandbox_sync.sh"
 hide = true
+
+["test:e2e:vm"]
+description = "Run e2e tests against a gateway VM (macOS ARM64)"
+depends = ["python:proto"]
+env = { UV_NO_SYNC = "1", PYTHONPATH = "python", NEMOCLAW_CLUSTER = "gateway" }
+run = "uv run pytest -o python_files='test_*.py' e2e/python"

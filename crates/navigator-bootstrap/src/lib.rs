@@ -4,13 +4,13 @@
 pub mod build;
 pub mod image;
 
-mod constants;
+pub mod constants;
 mod docker;
 mod kubeconfig;
 mod metadata;
-mod mtls;
+pub mod mtls;
 pub mod paths;
-mod pki;
+pub mod pki;
 pub(crate) mod push;
 mod runtime;
 

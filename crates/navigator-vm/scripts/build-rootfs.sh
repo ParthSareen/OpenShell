@@ -4,13 +4,13 @@
 
 # Build an aarch64 Ubuntu rootfs for the gateway microVM.
 #
-# Produces a rootfs with k3s pre-installed, plus the gateway-init.sh script
-# that runs as PID 1 inside the libkrun VM.
+# Produces a rootfs with k3s pre-installed, the NemoClaw helm chart and
+# manifests baked in, and container images pre-loaded for airgap boot.
 #
 # Usage:
 #   ./crates/navigator-vm/scripts/build-rootfs.sh [output_dir]
 #
-# Requires: Docker (or compatible container runtime), curl
+# Requires: Docker (or compatible container runtime), curl, helm
 
 set -euo pipefail
 
@@ -25,8 +25,19 @@ IMAGE_TAG="krun-rootfs:gateway"
 K3S_VERSION="${K3S_VERSION:-v1.29.8+k3s1}"
 K3S_VERSION="${K3S_VERSION//-k3s/+k3s}"
 
+# Project root (two levels up from crates/navigator-vm/scripts/)
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+# Container images to pre-load into k3s (arm64).
+IMAGE_REPO_BASE="${IMAGE_REPO_BASE:-d1i0nduu2f6qxk.cloudfront.net/navigator}"
+IMAGE_TAG="${IMAGE_TAG:-latest}"
+SERVER_IMAGE="${IMAGE_REPO_BASE}/server:${IMAGE_TAG}"
+SANDBOX_IMAGE="${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}"
+AGENT_SANDBOX_IMAGE="registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0"
+
 echo "==> Building gateway rootfs"
 echo "    k3s version: ${K3S_VERSION}"
+echo "    Images:      ${SERVER_IMAGE}, ${SANDBOX_IMAGE}"
 echo "    Output:      ${ROOTFS_DIR}"
 
 # ── Download k3s binary (outside Docker — much faster) ─────────────────
@@ -92,6 +103,69 @@ chmod +x "${ROOTFS_DIR}/srv/gateway-init.sh"
 cp "${SCRIPT_DIR}/hello-server.py" "${ROOTFS_DIR}/srv/hello-server.py"
 chmod +x "${ROOTFS_DIR}/srv/hello-server.py"
 
+# ── Package and inject helm chart ────────────────────────────────────
+
+HELM_CHART_DIR="${PROJECT_ROOT}/deploy/helm/navigator"
+CHART_DEST="${ROOTFS_DIR}/var/lib/rancher/k3s/server/static/charts"
+
+if [ -d "${HELM_CHART_DIR}" ]; then
+    echo "==> Packaging helm chart..."
+    mkdir -p "${CHART_DEST}"
+    helm package "${HELM_CHART_DIR}" -d "${CHART_DEST}"
+    echo "    $(ls "${CHART_DEST}"/*.tgz 2>/dev/null | xargs -I{} basename {})"
+else
+    echo "WARNING: Helm chart not found at ${HELM_CHART_DIR}, skipping"
+fi
+
+# ── Inject Kubernetes manifests ──────────────────────────────────────
+# These are copied to /opt/navigator/manifests/ (staging). gateway-init.sh
+# moves them to /var/lib/rancher/k3s/server/manifests/ at boot so the
+# k3s Helm Controller auto-deploys them.
+
+MANIFEST_SRC="${PROJECT_ROOT}/deploy/kube/manifests"
+MANIFEST_DEST="${ROOTFS_DIR}/opt/navigator/manifests"
+
+echo "==> Injecting Kubernetes manifests..."
+mkdir -p "${MANIFEST_DEST}"
+
+for manifest in navigator-helmchart.yaml agent-sandbox.yaml; do
+    if [ -f "${MANIFEST_SRC}/${manifest}" ]; then
+        cp "${MANIFEST_SRC}/${manifest}" "${MANIFEST_DEST}/"
+        echo "    ${manifest}"
+    else
+        echo "WARNING: ${manifest} not found in ${MANIFEST_SRC}"
+    fi
+done
+
+# ── Pre-load container images ────────────────────────────────────────
+# Pull arm64 images and save as tarballs in the k3s airgap images
+# directory. k3s auto-imports from /var/lib/rancher/k3s/agent/images/
+# on startup, so no internet access is needed at boot time.
+
+IMAGES_DIR="${ROOTFS_DIR}/var/lib/rancher/k3s/agent/images"
+mkdir -p "${IMAGES_DIR}"
+
+echo "==> Pre-loading container images (arm64)..."
+
+pull_and_save() {
+    local image="$1"
+    local output="$2"
+
+    if [ -f "${output}" ]; then
+        echo "    cached: $(basename "${output}")"
+        return 0
+    fi
+
+    echo "    pulling: ${image}..."
+    docker pull --platform linux/arm64 "${image}" --quiet
+    echo "    saving:  $(basename "${output}")..."
+    docker save "${image}" -o "${output}"
+}
+
+pull_and_save "${SERVER_IMAGE}" "${IMAGES_DIR}/navigator-server.tar"
+pull_and_save "${SANDBOX_IMAGE}" "${IMAGES_DIR}/navigator-sandbox.tar"
+pull_and_save "${AGENT_SANDBOX_IMAGE}" "${IMAGES_DIR}/agent-sandbox-controller.tar"
+
 # ── Verify ────────────────────────────────────────────────────────────
 
 if [ ! -f "${ROOTFS_DIR}/usr/local/bin/k3s" ]; then
@@ -102,6 +176,14 @@ fi
 echo ""
 echo "==> Rootfs ready at: ${ROOTFS_DIR}"
 echo "    Size: $(du -sh "${ROOTFS_DIR}" | cut -f1)"
+
+# Show image sizes
+echo "    Images:"
+for img in "${IMAGES_DIR}"/*.tar; do
+    [ -f "$img" ] || continue
+    echo "      $(basename "$img"): $(du -sh "$img" | cut -f1)"
+done
+
 echo ""
 echo "Next steps:"
 echo "  1. Run:  ncl gateway"

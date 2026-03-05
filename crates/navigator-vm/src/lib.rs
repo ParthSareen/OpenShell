@@ -51,6 +51,10 @@ pub enum VmError {
     /// `fork()` failed.
     #[error("fork() failed: {0}")]
     Fork(String),
+
+    /// Post-boot bootstrap failed.
+    #[error("bootstrap failed: {0}")]
+    Bootstrap(String),
 }
 
 /// Check a libkrun return code; negative values are errors.
@@ -125,13 +129,15 @@ pub struct VmConfig {
 impl VmConfig {
     /// Default gateway configuration: boots k3s server inside the VM.
     ///
-    /// Runs `/srv/gateway-init.sh` which mounts essential filesystems and
-    /// execs `k3s server`. Exposes the Kubernetes API on port 6443.
+    /// Runs `/srv/gateway-init.sh` which mounts essential filesystems,
+    /// deploys the `NemoClaw` helm chart, and execs `k3s server`.
+    /// Exposes the Kubernetes API on port 6443 and the `NemoClaw`
+    /// gateway (navigator server `NodePort`) on port 30051.
     pub fn gateway(rootfs: PathBuf) -> Self {
         Self {
             rootfs,
-            vcpus: 2,
-            mem_mib: 2048,
+            vcpus: 4,
+            mem_mib: 8192,
             exec_path: "/srv/gateway-init.sh".to_string(),
             args: vec![],
             env: vec![
@@ -140,10 +146,15 @@ impl VmConfig {
                 "TERM=xterm".to_string(),
             ],
             workdir: "/".to_string(),
-            // Map host 6443 -> guest 6444 (real kube-apiserver).
-            // The k3s dynamiclistener on 6443 has TLS issues through
-            // port forwarding, so we go directly to the apiserver.
-            port_map: vec!["6443:6444".to_string()],
+            port_map: vec![
+                // Map host 6443 -> guest 6444 (real kube-apiserver).
+                // The k3s dynamiclistener on 6443 has TLS issues through
+                // port forwarding, so we go directly to the apiserver.
+                "6443:6444".to_string(),
+                // Navigator server NodePort — the gateway endpoint for
+                // CLI clients and e2e tests.
+                "30051:30051".to_string(),
+            ],
             log_level: 3, // Info — for debugging
             console_output: None,
             net: NetBackend::Gvproxy {
@@ -624,7 +635,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 let kubeconfig_src = config.rootfs.join("etc/rancher/k3s/k3s.yaml");
                 eprintln!("Waiting for kubeconfig...");
                 let mut found = false;
-                for _ in 0..60 {
+                for _ in 0..120 {
                     if kubeconfig_src.is_file()
                         && std::fs::metadata(&kubeconfig_src)
                             .map(|m| m.len() > 0)
@@ -640,7 +651,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                     // Copy kubeconfig to ~/.kube/gateway.yaml, rewriting
                     // the server URL to point at the forwarded host port.
                     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    let kube_dir = PathBuf::from(home).join(".kube");
+                    let kube_dir = PathBuf::from(&home).join(".kube");
                     let _ = std::fs::create_dir_all(&kube_dir);
                     let dest = kube_dir.join("gateway.yaml");
 
@@ -659,8 +670,16 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                             eprintln!("  failed to read kubeconfig: {e}");
                         }
                     }
+
+                    // Bootstrap the NemoClaw control plane: generate PKI,
+                    // create TLS secrets, and store cluster metadata so CLI
+                    // clients and e2e tests can connect.
+                    if let Err(e) = bootstrap_gateway(&dest) {
+                        eprintln!("Bootstrap failed: {e}");
+                        eprintln!("  The VM is running but NemoClaw may not be fully operational.");
+                    }
                 } else {
-                    eprintln!("  kubeconfig not found after 60s (k3s may still be starting)");
+                    eprintln!("  kubeconfig not found after 120s (k3s may still be starting)");
                 }
             }
 
@@ -704,6 +723,202 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             Ok(status)
         }
     }
+}
+
+// ── Post-boot bootstrap ────────────────────────────────────────────────
+
+/// Cluster name used for metadata and mTLS storage.
+const GATEWAY_CLUSTER_NAME: &str = "gateway";
+
+/// Gateway port: the host port mapped to the navigator `NodePort` (30051).
+const GATEWAY_PORT: u16 = 30051;
+
+/// Bootstrap the `NemoClaw` control plane after k3s is ready.
+///
+/// This mirrors the Docker bootstrap path in `navigator-bootstrap` but runs
+/// kubectl from the host against the VM's forwarded kube-apiserver port.
+///
+/// Steps:
+/// 1. Wait for the `navigator` namespace (created by the Helm controller)
+/// 2. Generate a PKI bundle (CA, server cert, client cert)
+/// 3. Apply TLS secrets to the cluster via `kubectl`
+/// 4. Store cluster metadata and mTLS credentials on the host
+fn bootstrap_gateway(kubeconfig: &Path) -> Result<(), VmError> {
+    let kc = kubeconfig
+        .to_str()
+        .ok_or_else(|| VmError::InvalidPath(kubeconfig.display().to_string()))?;
+
+    // 1. Wait for the navigator namespace.
+    eprintln!("Waiting for navigator namespace...");
+    wait_for_namespace(kc)?;
+
+    // 2. Generate PKI.
+    eprintln!("Generating TLS certificates...");
+    let pki_bundle = navigator_bootstrap::pki::generate_pki(&[])
+        .map_err(|e| VmError::Bootstrap(format!("PKI generation failed: {e}")))?;
+
+    // 3. Apply TLS secrets.
+    eprintln!("Creating TLS secrets...");
+    apply_tls_secrets(kc, &pki_bundle)?;
+
+    // 4. Store cluster metadata and mTLS credentials.
+    eprintln!("Storing cluster metadata...");
+    let metadata = navigator_bootstrap::ClusterMetadata {
+        name: GATEWAY_CLUSTER_NAME.to_string(),
+        gateway_endpoint: format!("https://127.0.0.1:{GATEWAY_PORT}"),
+        is_remote: false,
+        gateway_port: GATEWAY_PORT,
+        kube_port: Some(6443),
+        remote_host: None,
+        resolved_host: None,
+    };
+
+    navigator_bootstrap::store_cluster_metadata(GATEWAY_CLUSTER_NAME, &metadata)
+        .map_err(|e| VmError::Bootstrap(format!("failed to store cluster metadata: {e}")))?;
+
+    navigator_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
+        .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS credentials: {e}")))?;
+
+    navigator_bootstrap::save_active_cluster(GATEWAY_CLUSTER_NAME)
+        .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
+
+    eprintln!("Bootstrap complete.");
+    eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
+    eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
+    eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+
+    Ok(())
+}
+
+/// Poll kubectl until the `navigator` namespace exists.
+fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
+    let max_attempts = 120;
+    for attempt in 0..max_attempts {
+        let output = std::process::Command::new("kubectl")
+            .args(["--kubeconfig", kubeconfig])
+            .args(["get", "namespace", "navigator", "-o", "name"])
+            .output();
+
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if stdout.contains("navigator") {
+                return Ok(());
+            }
+        }
+
+        if attempt % 10 == 9 {
+            eprintln!(
+                "  still waiting for navigator namespace ({}/{})",
+                attempt + 1,
+                max_attempts
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    Err(VmError::Bootstrap(
+        "timed out waiting for navigator namespace (240s). \
+         Check console.log for k3s errors."
+            .to_string(),
+    ))
+}
+
+/// Apply the three TLS K8s secrets required by the `NemoClaw` server.
+///
+/// Uses `kubectl apply -f -` on the host, piping JSON manifests via stdin.
+fn apply_tls_secrets(
+    kubeconfig: &str,
+    bundle: &navigator_bootstrap::pki::PkiBundle,
+) -> Result<(), VmError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    let secrets = [
+        // 1. navigator-server-tls (kubernetes.io/tls)
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": navigator_bootstrap::constants::SERVER_TLS_SECRET_NAME,
+                "namespace": "navigator"
+            },
+            "type": "kubernetes.io/tls",
+            "data": {
+                "tls.crt": STANDARD.encode(&bundle.server_cert_pem),
+                "tls.key": STANDARD.encode(&bundle.server_key_pem)
+            }
+        }),
+        // 2. navigator-server-client-ca (Opaque)
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": navigator_bootstrap::constants::SERVER_CLIENT_CA_SECRET_NAME,
+                "namespace": "navigator"
+            },
+            "type": "Opaque",
+            "data": {
+                "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+            }
+        }),
+        // 3. navigator-client-tls (Opaque) — shared by CLI and sandbox pods
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": navigator_bootstrap::constants::CLIENT_TLS_SECRET_NAME,
+                "namespace": "navigator"
+            },
+            "type": "Opaque",
+            "data": {
+                "tls.crt": STANDARD.encode(&bundle.client_cert_pem),
+                "tls.key": STANDARD.encode(&bundle.client_key_pem),
+                "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+            }
+        }),
+    ];
+
+    for secret in &secrets {
+        let name = secret["metadata"]["name"].as_str().unwrap_or("unknown");
+        kubectl_apply(kubeconfig, &secret.to_string())
+            .map_err(|e| VmError::Bootstrap(format!("failed to create secret {name}: {e}")))?;
+        eprintln!("  secret/{name} created");
+    }
+
+    Ok(())
+}
+
+/// Run `kubectl apply -f -` with the given manifest piped via stdin.
+fn kubectl_apply(kubeconfig: &str, manifest: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("kubectl")
+        .args(["--kubeconfig", kubeconfig, "apply", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to spawn kubectl: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(manifest.as_bytes())
+            .map_err(|e| format!("failed to write manifest to kubectl stdin: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to wait for kubectl: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("kubectl apply failed: {stderr}"));
+    }
+
+    Ok(())
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);

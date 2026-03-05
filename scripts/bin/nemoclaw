@@ -42,7 +42,7 @@ else
         return 0 ;;
       crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
+      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*|crates/navigator-vm/*)
         return 0 ;;
       *)
         return 1 ;;
@@ -117,7 +117,7 @@ if [[ "$needs_build" == "1" ]]; then
         return 0 ;;
       crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
+      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*|crates/navigator-vm/*)
         return 0 ;;
       *)
         return 1 ;;

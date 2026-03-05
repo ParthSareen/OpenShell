@@ -4,7 +4,8 @@
 
 # Init script for the gateway microVM. Runs as PID 1 inside the libkrun VM.
 #
-# Mounts essential virtual filesystems, then execs k3s server.
+# Mounts essential virtual filesystems, deploys bundled manifests (helm chart,
+# agent-sandbox controller), then execs k3s server.
 
 set -e
 
@@ -80,6 +81,14 @@ DHCP_SCRIPT
         ip route add default via 192.168.127.1 2>/dev/null || true
     fi
 
+    # Ensure DNS is configured. DHCP should have set /etc/resolv.conf,
+    # but if it didn't (or static fallback was used), provide a default.
+    if [ ! -s /etc/resolv.conf ]; then
+        echo "[gateway-init] no DNS configured, using public DNS"
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+    fi
+
     # Read back the IP we got (from DHCP or static).
     NODE_IP=$(ip -4 addr show eth0 | grep -oP 'inet \K[^/]+' || echo "192.168.127.2")
     echo "[gateway-init] eth0 IP: $NODE_IP"
@@ -110,6 +119,46 @@ rm -f  /var/lib/rancher/k3s/server/kine.sock           2>/dev/null || true
 find /var/lib/rancher/k3s -name '*.sock' -delete 2>/dev/null || true
 find /run -name '*.sock' -delete 2>/dev/null || true
 
+# ── Deploy bundled manifests ────────────────────────────────────────────
+# Copy manifests from the staging directory to the k3s auto-deploy path.
+# This mirrors the approach in cluster-entrypoint.sh for the Docker path.
+
+K3S_MANIFESTS="/var/lib/rancher/k3s/server/manifests"
+BUNDLED_MANIFESTS="/opt/navigator/manifests"
+
+mkdir -p "$K3S_MANIFESTS"
+
+if [ -d "$BUNDLED_MANIFESTS" ]; then
+    echo "[gateway-init] deploying bundled manifests..."
+    for manifest in "$BUNDLED_MANIFESTS"/*.yaml; do
+        [ ! -f "$manifest" ] && continue
+        cp "$manifest" "$K3S_MANIFESTS/"
+        echo "  $(basename "$manifest")"
+    done
+
+    # Remove stale navigator-managed manifests from previous boots.
+    for existing in "$K3S_MANIFESTS"/navigator-*.yaml \
+                    "$K3S_MANIFESTS"/agent-*.yaml; do
+        [ ! -f "$existing" ] && continue
+        basename=$(basename "$existing")
+        if [ ! -f "$BUNDLED_MANIFESTS/$basename" ]; then
+            echo "  removing stale: $basename"
+            rm -f "$existing"
+        fi
+    done
+fi
+
+# Patch the HelmChart manifest for VM deployment.
+HELMCHART="$K3S_MANIFESTS/navigator-helmchart.yaml"
+if [ -f "$HELMCHART" ]; then
+    echo "[gateway-init] patching HelmChart manifest..."
+    # Use pre-loaded images — don't pull from registry.
+    sed -i 's|pullPolicy: Always|pullPolicy: IfNotPresent|' "$HELMCHART"
+    # Clear SSH gateway placeholders (default 127.0.0.1 is correct for local VM).
+    sed -i 's|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: ""|g' "$HELMCHART"
+    sed -i 's|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g' "$HELMCHART"
+fi
+
 # ── Start k3s ──────────────────────────────────────────────────────────
 
 echo "[gateway-init] starting k3s server..."
@@ -117,8 +166,6 @@ exec /usr/local/bin/k3s server \
     --disable=traefik \
     --write-kubeconfig-mode=644 \
     --node-ip="$NODE_IP" \
-    --flannel-backend=none \
-    --disable-network-policy \
-    --disable-kube-proxy \
     --kube-apiserver-arg=bind-address=0.0.0.0 \
+    --resolv-conf=/etc/resolv.conf \
     --tls-san=localhost,127.0.0.1,10.0.2.15,192.168.127.2
