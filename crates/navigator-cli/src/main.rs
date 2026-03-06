@@ -9,10 +9,9 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
-use std::path::PathBuf;
 
 use navigator_bootstrap::{
-    load_active_cluster, load_cluster_metadata, load_last_sandbox, paths, save_last_sandbox,
+    load_active_cluster, load_cluster_metadata, load_last_sandbox, save_last_sandbox,
 };
 use navigator_cli::completers;
 use navigator_cli::run;
@@ -145,54 +144,6 @@ enum Commands {
 
     /// Launch the NemoClaw interactive TUI.
     Term,
-
-    /// Boot a libkrun microVM.
-    ///
-    /// By default, starts a k3s Kubernetes cluster inside the VM with the
-    /// API server on port 6443. Use `--exec` to run a custom process instead.
-    Gateway {
-        /// Path to the rootfs directory (aarch64 Linux).
-        /// Defaults to `~/.local/share/nemoclaw/gateway/rootfs`.
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        rootfs: Option<PathBuf>,
-
-        /// Executable path inside the VM. When set, runs this instead of
-        /// the default k3s server.
-        #[arg(long)]
-        exec: Option<String>,
-
-        /// Arguments to the executable (requires `--exec`).
-        #[arg(long, num_args = 1..)]
-        args: Vec<String>,
-
-        /// Environment variables in `KEY=VALUE` form (requires `--exec`).
-        #[arg(long, num_args = 1..)]
-        env: Vec<String>,
-
-        /// Working directory inside the VM.
-        #[arg(long, default_value = "/")]
-        workdir: String,
-
-        /// Port mappings (`host_port:guest_port`).
-        #[arg(long, short, num_args = 1..)]
-        port: Vec<String>,
-
-        /// Number of virtual CPUs (default: 4 for gateway, 2 for --exec).
-        #[arg(long)]
-        vcpus: Option<u8>,
-
-        /// RAM in MiB (default: 8192 for gateway, 2048 for --exec).
-        #[arg(long)]
-        mem: Option<u32>,
-
-        /// libkrun log level (0=Off .. 5=Trace).
-        #[arg(long, default_value_t = 1)]
-        krun_log_level: u32,
-
-        /// Networking backend: "gvproxy" (default), "tsi", or "none".
-        #[arg(long, default_value = "gvproxy")]
-        net: String,
-    },
 
     /// Generate shell completions.
     #[command(after_long_help = COMPLETIONS_HELP)]
@@ -1339,76 +1290,6 @@ async fn main() -> Result<()> {
             let tls = tls.with_cluster_name(&ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
-        }
-        Some(Commands::Gateway {
-            rootfs,
-            exec,
-            args,
-            env,
-            workdir,
-            port,
-            vcpus,
-            mem,
-            krun_log_level,
-            net,
-        }) => {
-            let net_backend = match net.as_str() {
-                "tsi" => navigator_vm::NetBackend::Tsi,
-                "none" => navigator_vm::NetBackend::None,
-                "gvproxy" => navigator_vm::NetBackend::Gvproxy {
-                    binary: PathBuf::from(
-                        // Try to find gvproxy
-                        [
-                            "/opt/podman/bin/gvproxy",
-                            "/opt/homebrew/bin/gvproxy",
-                            "/usr/local/bin/gvproxy",
-                        ]
-                        .iter()
-                        .find(|p| std::path::Path::new(p).exists())
-                        .unwrap_or(&"/opt/podman/bin/gvproxy"),
-                    ),
-                },
-                other => {
-                    return Err(miette::miette!(
-                        "unknown --net backend: {other} (expected: gvproxy, tsi, none)"
-                    ));
-                }
-            };
-
-            let rootfs = rootfs.map_or_else(paths::default_rootfs_dir, Ok)?;
-            let mut config = if let Some(exec_path) = exec {
-                navigator_vm::VmConfig {
-                    rootfs,
-                    vcpus: vcpus.unwrap_or(2),
-                    mem_mib: mem.unwrap_or(2048),
-                    exec_path,
-                    args,
-                    env,
-                    workdir,
-                    port_map: port,
-                    log_level: krun_log_level,
-                    console_output: None,
-                    net: net_backend.clone(),
-                }
-            } else {
-                let mut c = navigator_vm::VmConfig::gateway(rootfs);
-                if !port.is_empty() {
-                    c.port_map = port;
-                }
-                if let Some(v) = vcpus {
-                    c.vcpus = v;
-                }
-                if let Some(m) = mem {
-                    c.mem_mib = m;
-                }
-                c.net = net_backend;
-                c
-            };
-            config.log_level = krun_log_level;
-            let code = navigator_vm::launch(&config).map_err(|e| miette::miette!("{e}"))?;
-            if code != 0 {
-                std::process::exit(code);
-            }
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

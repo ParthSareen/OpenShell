@@ -14,13 +14,20 @@ description = "MicroVM runtime using libkrun for hardware-isolated execution"
 name = "navigator_vm"
 path = "src/lib.rs"
 
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
 [dependencies]
 base64 = "0.22"
+clap = { workspace = true }
 libc = "0.2"
 miette = { workspace = true }
 navigator-bootstrap = { path = "../navigator-bootstrap" }
 serde_json = "1"
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

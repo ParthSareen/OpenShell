@@ -42,7 +42,7 @@ else
         return 0 ;;
       crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*|crates/navigator-vm/*)
+      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
         return 0 ;;
       *)
         return 1 ;;
@@ -91,12 +91,6 @@ if [[ "$needs_build" == "1" ]]; then
   echo "Recompiling navigator-cli..." >&2
   cargo build --package navigator-cli --quiet
 
-  # On macOS, codesign with the hypervisor entitlement so libkrun can use
-  # Apple's Hypervisor.framework. Re-sign after every build.
-  ENTITLEMENTS="$PROJECT_ROOT/crates/navigator-vm/entitlements.plist"
-  if [[ "$(uname)" == "Darwin" ]] && [[ -f "$ENTITLEMENTS" ]]; then
-    codesign --entitlements "$ENTITLEMENTS" --force -s - "$BINARY" 2>/dev/null
-  fi
   # Persist state after successful build
   mkdir -p "$(dirname "$STATE_FILE")"
   cd "$PROJECT_ROOT"
@@ -117,7 +111,7 @@ if [[ "$needs_build" == "1" ]]; then
         return 0 ;;
       crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*|crates/navigator-vm/*)
+      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
         return 0 ;;
       *)
         return 1 ;;
@@ -145,14 +139,6 @@ if [[ "$needs_build" == "1" ]]; then
 head=${new_head}
 fingerprint=${new_fingerprint}
 EOF
-fi
-
-# Ensure libkrunfw is discoverable by libkrun's dlopen on macOS.
-# dyld only reads DYLD_FALLBACK_LIBRARY_PATH at process startup, so we
-# set it here before exec.
-if [[ "$(uname)" == "Darwin" ]]; then
-  HOMEBREW_LIB="$(brew --prefix 2>/dev/null || echo /opt/homebrew)/lib"
-  export DYLD_FALLBACK_LIBRARY_PATH="${HOMEBREW_LIB}${DYLD_FALLBACK_LIBRARY_PATH:+:$DYLD_FALLBACK_LIBRARY_PATH}"
 fi
 
 exec "$BINARY" "$@"

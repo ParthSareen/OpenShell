@@ -2717,7 +2717,6 @@ dependencies = [
  "navigator-policy",
  "navigator-providers",
  "navigator-tui",
- "navigator-vm",
  "owo-colors",
  "prost-types",
  "rcgen",
@@ -2904,11 +2903,14 @@ name = "navigator-vm"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "clap",
  "libc",
  "miette",
  "navigator-bootstrap",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
