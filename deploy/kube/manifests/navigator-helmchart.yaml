@@ -24,14 +24,21 @@ spec:
   valuesContent: |-
     chartChecksum: __CHART_CHECKSUM__
     image:
-      repository: d1i0nduu2f6qxk.cloudfront.net/navigator/server
-      tag: latest
+      repository: __IMAGE_REPO_BASE__/server
+      tag: __IMAGE_TAG__
       pullPolicy: Always
+    hostNetwork: __HOST_NETWORK__
+    automountServiceAccountToken: __AUTOMOUNT_SA_TOKEN__
+    kubeconfig:
+      hostPath: __KUBECONFIG_HOST_PATH__
+    persistence:
+      enabled: __PERSISTENCE_ENABLED__
     server:
-      sandboxImage: d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest
+      sandboxImage: __IMAGE_REPO_BASE__/sandbox:__IMAGE_TAG__
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
       sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
+      dbUrl: __DB_URL__
       grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
       tls:
         certSecretName: navigator-server-tls

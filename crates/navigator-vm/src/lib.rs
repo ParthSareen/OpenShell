@@ -20,6 +20,7 @@ use std::ffi::CString;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::Instant;
 
 // ── Error type ─────────────────────────────────────────────────────────
 
@@ -151,9 +152,12 @@ impl VmConfig {
                 // The k3s dynamiclistener on 6443 has TLS issues through
                 // port forwarding, so we go directly to the apiserver.
                 "6443:6444".to_string(),
-                // Navigator server NodePort — the gateway endpoint for
-                // CLI clients and e2e tests.
-                "30051:30051".to_string(),
+                // Navigator server — with hostNetwork the server binds
+                // directly to port 8080 on the VM's interface, bypassing
+                // NodePort (which requires kube-proxy / iptables).
+                // Map host 30051 -> guest 8080 so the external-facing
+                // port stays the same for CLI clients.
+                "30051:8080".to_string(),
             ],
             log_level: 3, // Info — for debugging
             console_output: None,
@@ -311,6 +315,24 @@ fn gvproxy_expose(api_sock: &Path, body: &str) -> Result<(), String> {
     }
 }
 
+/// Kill any stale gvproxy process from a previous gateway run.
+///
+/// If the CLI crashes or is killed before cleanup, gvproxy keeps running
+/// and holds port 2222. A new gvproxy instance then fails with
+/// "bind: address already in use".
+fn kill_stale_gvproxy() {
+    let output = std::process::Command::new("pkill")
+        .args(["-x", "gvproxy"])
+        .output();
+    if let Ok(o) = output {
+        if o.status.success() {
+            eprintln!("Killed stale gvproxy process");
+            // Brief pause for the port to be released.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+}
+
 fn path_to_cstring(path: &Path) -> Result<CString, VmError> {
     let s = path
         .to_str()
@@ -335,6 +357,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         });
     }
 
+    let launch_start = Instant::now();
     eprintln!("rootfs: {}", config.rootfs.display());
     eprintln!("vm: {} vCPU(s), {} MiB RAM", config.vcpus, config.mem_mib);
 
@@ -422,9 +445,17 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             let vfkit_sock = run_dir.join("gvproxy-vfkit.sock");
             let api_sock = run_dir.join("gvproxy-api.sock");
 
-            // Clean stale sockets
+            // Kill any stale gvproxy process from a previous run.
+            // If gvproxy is still holding port 2222, the new instance
+            // will fail with "bind: address already in use".
+            kill_stale_gvproxy();
+
+            // Clean stale sockets (including the -krun.sock file that
+            // libkrun creates as its datagram endpoint).
             let _ = std::fs::remove_file(&vfkit_sock);
             let _ = std::fs::remove_file(&api_sock);
+            let krun_sock = run_dir.join("gvproxy-vfkit.sock-krun.sock");
+            let _ = std::fs::remove_file(&krun_sock);
 
             // Start gvproxy
             eprintln!("Starting gvproxy: {}", binary.display());
@@ -441,19 +472,25 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 .spawn()
                 .map_err(|e| VmError::Fork(format!("failed to start gvproxy: {e}")))?;
 
-            eprintln!("gvproxy started (pid {})", child.id());
+            eprintln!(
+                "gvproxy started (pid {}) [{:.1}s]",
+                child.id(),
+                launch_start.elapsed().as_secs_f64()
+            );
 
-            // Wait for the socket to appear
-            for _ in 0..50 {
-                if vfkit_sock.exists() {
-                    break;
+            // Wait for the socket to appear (exponential backoff: 5ms → 100ms).
+            {
+                let deadline = Instant::now() + std::time::Duration::from_secs(5);
+                let mut interval = std::time::Duration::from_millis(5);
+                while !vfkit_sock.exists() {
+                    if Instant::now() >= deadline {
+                        return Err(VmError::Fork(
+                            "gvproxy socket did not appear within 5s".to_string(),
+                        ));
+                    }
+                    std::thread::sleep(interval);
+                    interval = (interval * 2).min(std::time::Duration::from_millis(100));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if !vfkit_sock.exists() {
-                return Err(VmError::Fork(
-                    "gvproxy socket did not appear within 5s".to_string(),
-                ));
             }
 
             // Disable implicit TSI and add virtio-net via gvproxy
@@ -500,7 +537,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 )?;
             }
 
-            eprintln!("Networking: gvproxy (virtio-net via {vfkit_sock:?})");
+            eprintln!(
+                "Networking: gvproxy (virtio-net) [{:.1}s]",
+                launch_start.elapsed().as_secs_f64()
+            );
             gvproxy_child = Some(child);
             gvproxy_api_sock = Some(api_sock);
         }
@@ -571,6 +611,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
     // krun_start_enter() never returns — it calls exit() when the guest
     // process exits. We fork so the parent can monitor and report.
 
+    let boot_start = Instant::now();
     eprintln!("Booting microVM...");
 
     let pid = unsafe { libc::fork() };
@@ -584,7 +625,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
         }
         _ => {
             // Parent: wait for child
-            eprintln!("VM started (child pid {pid})");
+            eprintln!(
+                "VM started (child pid {pid}) [{:.1}s]",
+                boot_start.elapsed().as_secs_f64()
+            );
             for pm in &config.port_map {
                 let host_port = pm.split(':').next().unwrap_or(pm);
                 eprintln!("  port {pm} -> http://localhost:{host_port}");
@@ -595,10 +639,27 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // The port_map entries use the same "host:guest" format
             // as TSI, but here we translate them into gvproxy expose
             // calls targeting the guest IP (192.168.127.2).
+            //
+            // Instead of a fixed 500ms sleep, poll the API socket with
+            // exponential backoff (5ms → 200ms, ~1s total budget).
             if let Some(ref api_sock) = gvproxy_api_sock {
-                // Wait for gvproxy API socket to be ready
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                eprintln!("Setting up gvproxy port forwarding...");
+                let fwd_start = Instant::now();
+                // Wait for the API socket to appear (it lags slightly
+                // behind the vfkit data socket).
+                {
+                    let deadline = Instant::now() + std::time::Duration::from_secs(2);
+                    let mut interval = std::time::Duration::from_millis(5);
+                    while !api_sock.exists() {
+                        if Instant::now() >= deadline {
+                            eprintln!(
+                                "warning: gvproxy API socket not ready after 2s, attempting anyway"
+                            );
+                            break;
+                        }
+                        std::thread::sleep(interval);
+                        interval = (interval * 2).min(std::time::Duration::from_millis(200));
+                    }
+                }
 
                 let guest_ip = "192.168.127.2";
 
@@ -626,6 +687,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                         }
                     }
                 }
+                eprintln!(
+                    "Port forwarding ready [{:.1}s]",
+                    fwd_start.elapsed().as_secs_f64()
+                );
             }
 
             // Wait for k3s kubeconfig to appear (virtio-fs makes it
@@ -633,9 +698,15 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
             // (when exec_path is the default init script).
             if config.exec_path == "/srv/gateway-init.sh" {
                 let kubeconfig_src = config.rootfs.join("etc/rancher/k3s/k3s.yaml");
+                let kc_start = Instant::now();
                 eprintln!("Waiting for kubeconfig...");
+
+                // Aggressive polling initially (100ms) then back off to 1s.
+                // Total budget: ~90s (enough for k3s cold start).
                 let mut found = false;
-                for _ in 0..120 {
+                let deadline = Instant::now() + std::time::Duration::from_secs(90);
+                let mut interval = std::time::Duration::from_millis(100);
+                while Instant::now() < deadline {
                     if kubeconfig_src.is_file()
                         && std::fs::metadata(&kubeconfig_src)
                             .map(|m| m.len() > 0)
@@ -644,10 +715,15 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                         found = true;
                         break;
                     }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(interval);
+                    interval = (interval * 2).min(std::time::Duration::from_secs(1));
                 }
 
                 if found {
+                    eprintln!(
+                        "Kubeconfig appeared [{:.1}s]",
+                        kc_start.elapsed().as_secs_f64()
+                    );
                     // Copy kubeconfig to ~/.kube/gateway.yaml, rewriting
                     // the server URL to point at the forwarded host port.
                     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -674,15 +750,34 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                     // Bootstrap the NemoClaw control plane: generate PKI,
                     // create TLS secrets, and store cluster metadata so CLI
                     // clients and e2e tests can connect.
-                    if let Err(e) = bootstrap_gateway(&dest) {
+                    //
+                    // If the rootfs has pre-baked PKI (from build-rootfs.sh),
+                    // this skips the namespace wait and kubectl apply entirely.
+                    if let Err(e) = bootstrap_gateway(&dest, &config.rootfs) {
                         eprintln!("Bootstrap failed: {e}");
                         eprintln!("  The VM is running but NemoClaw may not be fully operational.");
                     }
                 } else {
-                    eprintln!("  kubeconfig not found after 120s (k3s may still be starting)");
+                    eprintln!("  kubeconfig not found after 90s (k3s may still be starting)");
                 }
+
+                // On warm reboots (rootfs persists via virtio-fs), the k3s
+                // database may have stale pod records from the previous
+                // session. containerd v2 doesn't always recover these
+                // automatically. Force-delete any pods stuck in Unknown
+                // or failed state so the StatefulSet controller recreates
+                // them.
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let kubeconfig_dest = PathBuf::from(&home).join(".kube/gateway.yaml");
+                recover_stale_pods(&kubeconfig_dest);
+
+                // Wait for the gRPC service to be reachable before
+                // declaring "Ready". The navigator pod needs a few
+                // seconds after k3s starts to bind its port.
+                wait_for_gateway_service();
             }
 
+            eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());
             eprintln!("Press Ctrl+C to stop.");
 
             // Forward signals to child
@@ -735,34 +830,22 @@ const GATEWAY_PORT: u16 = 30051;
 
 /// Bootstrap the `NemoClaw` control plane after k3s is ready.
 ///
-/// This mirrors the Docker bootstrap path in `navigator-bootstrap` but runs
-/// kubectl from the host against the VM's forwarded kube-apiserver port.
+/// Three paths, fastest first:
 ///
-/// Steps:
-/// 1. Wait for the `navigator` namespace (created by the Helm controller)
-/// 2. Generate a PKI bundle (CA, server cert, client cert)
-/// 3. Apply TLS secrets to the cluster via `kubectl`
-/// 4. Store cluster metadata and mTLS credentials on the host
-fn bootstrap_gateway(kubeconfig: &Path) -> Result<(), VmError> {
-    let kc = kubeconfig
-        .to_str()
-        .ok_or_else(|| VmError::InvalidPath(kubeconfig.display().to_string()))?;
+/// 1. **Pre-baked PKI** (from `build-rootfs.sh`): reads PEM files directly
+///    from the rootfs, stores creds + metadata on the host. No cluster
+///    interaction at all. Completes in <50ms.
+///
+/// 2. **Warm boot**: host-side metadata + mTLS certs survive across VM
+///    restarts. Waits for the navigator namespace, then returns.
+///
+/// 3. **Cold boot**: generates fresh PKI, waits for namespace, applies
+///    secrets via kubectl, stores everything on the host.
+fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
+    let bootstrap_start = Instant::now();
 
-    // 1. Wait for the navigator namespace.
-    eprintln!("Waiting for navigator namespace...");
-    wait_for_namespace(kc)?;
-
-    // 2. Generate PKI.
-    eprintln!("Generating TLS certificates...");
-    let pki_bundle = navigator_bootstrap::pki::generate_pki(&[])
-        .map_err(|e| VmError::Bootstrap(format!("PKI generation failed: {e}")))?;
-
-    // 3. Apply TLS secrets.
-    eprintln!("Creating TLS secrets...");
-    apply_tls_secrets(kc, &pki_bundle)?;
-
-    // 4. Store cluster metadata and mTLS credentials.
-    eprintln!("Storing cluster metadata...");
+    // Build cluster metadata early — it only depends on knowing the port and
+    // cluster name, not on the cluster being ready.
     let metadata = navigator_bootstrap::ClusterMetadata {
         name: GATEWAY_CLUSTER_NAME.to_string(),
         gateway_endpoint: format!("https://127.0.0.1:{GATEWAY_PORT}"),
@@ -773,8 +856,87 @@ fn bootstrap_gateway(kubeconfig: &Path) -> Result<(), VmError> {
         resolved_host: None,
     };
 
+    // ── Path 1: Pre-baked PKI from build-rootfs.sh ─────────────────
+    //
+    // If the rootfs was pre-initialized, PKI files are baked into
+    // /opt/navigator/pki/. Read them directly — no cluster interaction
+    // needed. The TLS secrets already exist inside the cluster from
+    // the build-time k3s boot.
+    let pki_dir = rootfs.join("opt/navigator/pki");
+    if pki_dir.join("ca.crt").is_file() {
+        eprintln!("Pre-baked PKI detected — fast bootstrap");
+
+        let read = |name: &str| -> Result<String, VmError> {
+            std::fs::read_to_string(pki_dir.join(name))
+                .map_err(|e| VmError::Bootstrap(format!("failed to read {name}: {e}")))
+        };
+
+        let pki_bundle = navigator_bootstrap::pki::PkiBundle {
+            ca_cert_pem: read("ca.crt")?,
+            ca_key_pem: read("ca.key")?,
+            server_cert_pem: read("server.crt")?,
+            server_key_pem: read("server.key")?,
+            client_cert_pem: read("client.crt")?,
+            client_key_pem: read("client.key")?,
+        };
+
+        // Store metadata and credentials on the host.
+        navigator_bootstrap::store_cluster_metadata(GATEWAY_CLUSTER_NAME, &metadata)
+            .map_err(|e| VmError::Bootstrap(format!("failed to store metadata: {e}")))?;
+
+        navigator_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
+            .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS creds: {e}")))?;
+
+        navigator_bootstrap::save_active_cluster(GATEWAY_CLUSTER_NAME)
+            .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
+
+        eprintln!(
+            "Bootstrap complete [{:.1}s]",
+            bootstrap_start.elapsed().as_secs_f64()
+        );
+        eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
+        eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
+        eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+        return Ok(());
+    }
+
+    // ── Path 2: Warm boot ──────────────────────────────────────────
+    //
+    // Host-side metadata + mTLS certs survive from a previous boot.
+    // Just wait for the namespace to confirm k3s is ready.
+    let kc = kubeconfig
+        .to_str()
+        .ok_or_else(|| VmError::InvalidPath(kubeconfig.display().to_string()))?;
+
+    if is_warm_boot() {
+        eprintln!("Warm boot detected — reusing existing PKI and metadata.");
+        eprintln!("Waiting for navigator namespace...");
+        wait_for_namespace(kc)?;
+        eprintln!(
+            "Warm boot ready [{:.1}s]",
+            bootstrap_start.elapsed().as_secs_f64()
+        );
+        eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
+        eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
+        eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+        return Ok(());
+    }
+
+    // ── Path 3: Cold boot (no pre-baked state) ─────────────────────
+    eprintln!("Generating TLS certificates...");
+    let pki_bundle = navigator_bootstrap::pki::generate_pki(&[])
+        .map_err(|e| VmError::Bootstrap(format!("PKI generation failed: {e}")))?;
+
     navigator_bootstrap::store_cluster_metadata(GATEWAY_CLUSTER_NAME, &metadata)
         .map_err(|e| VmError::Bootstrap(format!("failed to store cluster metadata: {e}")))?;
+
+    let ns_start = Instant::now();
+    eprintln!("Waiting for navigator namespace...");
+    wait_for_namespace(kc)?;
+    eprintln!("Namespace ready [{:.1}s]", ns_start.elapsed().as_secs_f64());
+
+    eprintln!("Creating TLS secrets...");
+    apply_tls_secrets(kc, &pki_bundle)?;
 
     navigator_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
         .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS credentials: {e}")))?;
@@ -782,7 +944,10 @@ fn bootstrap_gateway(kubeconfig: &Path) -> Result<(), VmError> {
     navigator_bootstrap::save_active_cluster(GATEWAY_CLUSTER_NAME)
         .map_err(|e| VmError::Bootstrap(format!("failed to set active cluster: {e}")))?;
 
-    eprintln!("Bootstrap complete.");
+    eprintln!(
+        "Bootstrap complete [{:.1}s]",
+        bootstrap_start.elapsed().as_secs_f64()
+    );
     eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
     eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
     eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
@@ -790,10 +955,249 @@ fn bootstrap_gateway(kubeconfig: &Path) -> Result<(), VmError> {
     Ok(())
 }
 
+/// Check whether a previous bootstrap left valid state on disk.
+///
+/// A warm boot is detected when both:
+/// - Cluster metadata exists: `$XDG_CONFIG_HOME/nemoclaw/clusters/gateway_metadata.json`
+/// - mTLS certs exist: `$XDG_CONFIG_HOME/nemoclaw/clusters/gateway/mtls/{ca.crt,tls.crt,tls.key}`
+///
+/// When true, the host-side bootstrap (PKI generation, kubectl apply, metadata
+/// storage) can be skipped because the virtio-fs rootfs persists k3s state
+/// (TLS certs, kine/sqlite, containerd images, helm releases) across VM restarts.
+fn is_warm_boot() -> bool {
+    let Ok(home) = std::env::var("HOME") else {
+        return false;
+    };
+
+    let config_base =
+        std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
+
+    let config_dir = PathBuf::from(&config_base)
+        .join("nemoclaw")
+        .join("clusters");
+
+    // Check metadata file.
+    let metadata_path = config_dir.join(format!("{GATEWAY_CLUSTER_NAME}_metadata.json"));
+    if !metadata_path.is_file() {
+        return false;
+    }
+
+    // Check mTLS cert files.
+    let mtls_dir = config_dir.join(GATEWAY_CLUSTER_NAME).join("mtls");
+    for name in &["ca.crt", "tls.crt", "tls.key"] {
+        let path = mtls_dir.join(name);
+        match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() && m.len() > 0 => {}
+            _ => return false,
+        }
+    }
+
+    true
+}
+
+/// Wait for the navigator pod to become Ready inside the k3s cluster
+/// and verify the gRPC service is reachable from the host.
+///
+/// Stale pod/lease records are cleaned from the kine DB at build time
+/// (see `build-rootfs.sh`). Containerd metadata (meta.db) is preserved
+/// across boots so the native snapshotter doesn't re-extract image layers.
+/// Runtime task state is cleaned by `gateway-init.sh` on each boot.
+///
+/// We poll kubectl for `Ready=True`, then verify with a host-side TCP
+/// probe to `127.0.0.1:30051` to confirm the full gvproxy->VM->pod
+/// path works. gvproxy accepts TCP connections even when nothing listens
+/// in the guest, but those connections reset immediately. A connection
+/// that stays open (server waiting for TLS `ClientHello`) proves the pod
+/// is genuinely serving.
+fn wait_for_gateway_service() {
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_secs(90);
+    let poll_interval = std::time::Duration::from_secs(1);
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let kubeconfig = PathBuf::from(&home).join(".kube/gateway.yaml");
+    let kc = kubeconfig.to_string_lossy();
+
+    eprintln!("Waiting for gateway service...");
+
+    loop {
+        // Check if the pod is Ready.
+        let is_ready = std::process::Command::new("kubectl")
+            .args(["--kubeconfig", &kc])
+            .args([
+                "-n",
+                "navigator",
+                "get",
+                "pod",
+                "navigator-0",
+                "-o",
+                "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
+            ])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .is_some_and(|s| s == "True");
+
+        if is_ready {
+            // Pod reports Ready — verify with a host-side TCP probe to
+            // confirm the full gvproxy -> VM -> pod path works.
+            if host_tcp_probe() {
+                eprintln!("Service healthy [{:.1}s]", start.elapsed().as_secs_f64());
+                return;
+            }
+            eprintln!("  pod Ready but host TCP probe failed, retrying...");
+        }
+
+        if start.elapsed() >= timeout {
+            eprintln!(
+                "  gateway service not ready after {:.0}s, continuing anyway",
+                timeout.as_secs_f64()
+            );
+            return;
+        }
+
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Force-delete pods stuck in `Unknown` or failed states (safety net).
+///
+/// On warm reboots (virtio-fs persists rootfs across VM restarts), the
+/// k3s database retains pod records from the previous session. Containerd
+/// runtime task state is cleaned but metadata (meta.db) is preserved to
+/// avoid re-extracting image layers. This function is a safety net for
+/// edge cases where reconciliation fails — it force-deletes pods in
+/// `Unknown` or `Failed` state so controllers can recreate them.
+fn recover_stale_pods(kubeconfig: &Path) {
+    let kc = kubeconfig.to_string_lossy();
+
+    // Wait briefly for the API server to be responsive.
+    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+    let mut interval = std::time::Duration::from_millis(500);
+    loop {
+        if let Ok(output) = std::process::Command::new("kubectl")
+            .args(["--kubeconfig", &kc])
+            .args(["get", "nodes", "-o", "name"])
+            .output()
+        {
+            if output.status.success() {
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            eprintln!("  API server not ready after 30s, skipping pod recovery");
+            return;
+        }
+        std::thread::sleep(interval);
+        interval = (interval * 2).min(std::time::Duration::from_secs(2));
+    }
+
+    // Get all pods in a parseable format: namespace/name status
+    let output = std::process::Command::new("kubectl")
+        .args(["--kubeconfig", &kc])
+        .args([
+            "get", "pods", "-A",
+            "-o", "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.phase}\\n{end}",
+        ])
+        .output();
+
+    let Ok(output) = output else { return };
+    if !output.status.success() {
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stale_count = 0u32;
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let (ns_name, phase) = (parts[0], parts[1]);
+        // Delete pods in Unknown or Failed state — they can't recover
+        // from stale containerd sandbox state.
+        if phase == "Unknown" || phase == "Failed" {
+            let ns_and_name: Vec<&str> = ns_name.splitn(2, '/').collect();
+            if ns_and_name.len() != 2 {
+                continue;
+            }
+            let (ns, name) = (ns_and_name[0], ns_and_name[1]);
+            let result = std::process::Command::new("kubectl")
+                .args(["--kubeconfig", &kc])
+                .args([
+                    "-n",
+                    ns,
+                    "delete",
+                    "pod",
+                    name,
+                    "--force",
+                    "--grace-period=0",
+                ])
+                .output();
+
+            if let Ok(r) = result {
+                if r.status.success() {
+                    stale_count += 1;
+                }
+            }
+        }
+    }
+
+    if stale_count > 0 {
+        eprintln!("Recovered {stale_count} stale pod(s)");
+    }
+}
+
+/// Probe `127.0.0.1:30051` from the host to verify the full
+/// gvproxy → VM → pod path is working.
+///
+/// gvproxy accepts TCP connections even when the guest port is closed,
+/// but those connections are immediately reset. A server that is truly
+/// listening will hold the connection open (waiting for a TLS
+/// ClientHello). We exploit this: connect, then try a short read. If
+/// the read **times out** the server is alive; if it returns an error
+/// (reset/EOF) the server is down.
+fn host_tcp_probe() -> bool {
+    use std::io::Read;
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let addr: SocketAddr = ([127, 0, 0, 1], GATEWAY_PORT).into();
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return false;
+    };
+
+    // A short read timeout: if the server is alive it will wait for us
+    // to send a TLS ClientHello, so the read will time out (= good).
+    // If the connection resets or closes, the server is dead.
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .ok();
+    let mut buf = [0u8; 1];
+    match stream.read(&mut buf) {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            true // Timeout = server alive, waiting for ClientHello.
+        }
+        _ => false, // Reset, EOF, or unexpected data = not healthy.
+    }
+}
+
 /// Poll kubectl until the `navigator` namespace exists.
+///
+/// Uses exponential backoff (500ms → 3s) to minimize latency when the
+/// namespace appears quickly while avoiding kubectl spam.
 fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
-    let max_attempts = 120;
-    for attempt in 0..max_attempts {
+    let start = Instant::now();
+    let timeout = std::time::Duration::from_secs(180);
+    let mut interval = std::time::Duration::from_millis(500);
+    let mut attempts = 0u32;
+
+    loop {
         let output = std::process::Command::new("kubectl")
             .args(["--kubeconfig", kubeconfig])
             .args(["get", "namespace", "navigator", "-o", "name"])
@@ -808,21 +1212,25 @@ fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
             }
         }
 
-        if attempt % 10 == 9 {
+        if start.elapsed() >= timeout {
+            return Err(VmError::Bootstrap(
+                "timed out waiting for navigator namespace (180s). \
+                 Check console.log for k3s errors."
+                    .to_string(),
+            ));
+        }
+
+        attempts += 1;
+        if attempts.is_multiple_of(10) {
             eprintln!(
-                "  still waiting for navigator namespace ({}/{})",
-                attempt + 1,
-                max_attempts
+                "  still waiting for navigator namespace ({:.0}s elapsed)",
+                start.elapsed().as_secs_f64()
             );
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
 
-    Err(VmError::Bootstrap(
-        "timed out waiting for navigator namespace (240s). \
-         Check console.log for k3s errors."
-            .to_string(),
-    ))
+        std::thread::sleep(interval);
+        interval = (interval * 2).min(std::time::Duration::from_secs(3));
+    }
 }
 
 /// Apply the three TLS K8s secrets required by the `NemoClaw` server.

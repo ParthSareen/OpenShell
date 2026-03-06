@@ -23,11 +23,16 @@ spec:
         {{- end }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.podLifecycle.terminationGracePeriodSeconds }}
+      {{- if .Values.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "navigator.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.automountServiceAccountToken }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -68,15 +73,27 @@ spec:
               value: /etc/navigator-tls/client-ca/ca.crt
             - name: NEMOCLAW_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
+            {{- if and (not .Values.automountServiceAccountToken) .Values.kubeconfig.hostPath }}
+            - name: KUBECONFIG
+              value: /etc/navigator/kubeconfig
+            {{- end }}
           volumeMounts:
+            {{- if .Values.persistence.enabled }}
             - name: navigator-data
               mountPath: /var/navigator
+            {{- end }}
             - name: tls-cert
               mountPath: /etc/navigator-tls/server
               readOnly: true
             - name: tls-client-ca
               mountPath: /etc/navigator-tls/client-ca
               readOnly: true
+            {{- if and (not .Values.automountServiceAccountToken) .Values.kubeconfig.hostPath }}
+            - name: kubeconfig
+              mountPath: /etc/navigator/kubeconfig
+              subPath: k3s.yaml
+              readOnly: true
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.service.port }}
@@ -104,6 +121,16 @@ spec:
         - name: tls-client-ca
           secret:
             secretName: {{ .Values.server.tls.clientCaSecretName }}
+        {{- if not .Values.persistence.enabled }}
+        - name: navigator-data
+          emptyDir: {}
+        {{- end }}
+        {{- if and (not .Values.automountServiceAccountToken) .Values.kubeconfig.hostPath }}
+        - name: kubeconfig
+          hostPath:
+            path: {{ .Values.kubeconfig.hostPath }}
+            type: Directory
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -116,6 +143,7 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+  {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
     - metadata:
         name: navigator-data
@@ -124,3 +152,4 @@ spec:
         resources:
           requests:
             storage: 1Gi
+  {{- end }}
